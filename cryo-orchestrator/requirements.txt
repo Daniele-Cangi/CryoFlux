@@ -1,0 +1,11 @@
+blake3
+psutil
+pynvml
+numpy
+faiss-cpu
+sentence-transformers
+transformers
+peft
+torch
+pyyaml
+requests
