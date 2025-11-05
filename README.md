@@ -18,7 +18,7 @@ The system:
 **Result**: A verifiable audit trail proving "X joules → Y Δ improvement."
 
 For details, see [WHITEPAPER.md](WHITEPAPER.md).
-
+<img width="1646" height="898" alt="Screenshot 2025-10-26 035630" src="https://github.com/user-attachments/assets/44516fcd-6e11-444f-8beb-5698fdb8d221" />
 ---
 
 ## Architecture
