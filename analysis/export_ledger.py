@@ -166,39 +166,73 @@ def compute_cost_metrics(joules: float, config: CostConfig) -> tuple:
     return (kwh_eff, cost_eur, co2_g)
 
 
-def export_ledger(accepted_only: bool, output_path: Optional[str]):
+def export_ledger(accepted_only: bool, output_path: Optional[str], no_header: bool):
     """
     Export receipts as NDJSON ledger.
 
     Args:
         accepted_only: If True, only export accepted receipts
         output_path: Output file path (None = stdout)
+        no_header: If True, suppress all human-readable output
     """
-    print("=" * 60)
-    print("CryoFlux Ledger Export")
-    print("=" * 60)
-    print()
+    # Print header only if no_header is False and not writing to file
+    if not no_header and output_path is None:
+        print("=" * 60)
+        print("CryoFlux Ledger Export")
+        print("=" * 60)
+        print()
 
-    # Load cost config
+    # Load cost config (suppress output if no_header)
     config = load_cost_config()
     if not config:
-        print("[ERROR] Could not load cost model configuration")
+        if not no_header:
+            print("[ERROR] Could not load cost model configuration")
         sys.exit(1)
 
     if not config.enabled:
-        print("[INFO] Cost model is disabled (cost_model.enabled = false)")
+        if not no_header:
+            print("[INFO] Cost model is disabled (cost_model.enabled = false)")
         sys.exit(0)
 
     # Open database
     try:
         conn = open_db()
-        print("[INFO] Connected to receipts database")
+        if not no_header and output_path is None:
+            print("[INFO] Connected to receipts database")
     except Exception as e:
-        print(f"[ERROR] Could not connect to database: {e}")
+        if not no_header:
+            print(f"[ERROR] Could not connect to database: {e}")
         sys.exit(1)
 
-    # Ensure receipts_canonical view exists
-    ensure_receipts_canonical_view(conn)
+    # Ensure receipts_canonical view exists (suppress output if no_header)
+    if not no_header and output_path is None:
+        ensure_receipts_canonical_view(conn)
+    else:
+        # Silent version
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='view' AND name='receipts_canonical'")
+        if not cursor.fetchone():
+            cursor.execute("""
+                CREATE VIEW IF NOT EXISTS receipts_canonical AS
+                SELECT
+                    id,
+                    datetime(ts, 'unixepoch') AS timestamp,
+                    ts AS ts_unix,
+                    task AS task_name,
+                    joule AS joules_spent,
+                    sec AS execution_time_sec,
+                    delta,
+                    loss,
+                    delta_hash,
+                    meta,
+                    CASE
+                        WHEN json_extract(meta, '$.accepted') = 1 THEN 1
+                        WHEN json_extract(meta, '$.accepted') = 'true' THEN 1
+                        ELSE 0
+                    END AS accepted
+                FROM receipts
+            """)
+            conn.commit()
 
     # Build query
     query = """
@@ -219,29 +253,39 @@ def export_ledger(accepted_only: bool, output_path: Optional[str]):
         cursor.execute(query)
         rows = cursor.fetchall()
     except sqlite3.OperationalError as e:
-        print(f"[ERROR] Could not query receipts_canonical: {e}")
+        if not no_header:
+            print(f"[ERROR] Could not query receipts_canonical: {e}")
         conn.close()
         sys.exit(1)
 
     if not rows:
-        print("[WARN] No receipts found in database")
+        if not no_header:
+            print("[WARN] No receipts found in database")
         conn.close()
         sys.exit(0)
 
     # Open output destination
     if output_path:
+        # Create directory if needed
+        from pathlib import Path
+        output_dir = Path(output_path).parent
+        if output_dir and not output_dir.exists():
+            output_dir.mkdir(parents=True, exist_ok=True)
+
         try:
             output_file = open(output_path, 'w', encoding='utf-8')
-            print(f"[INFO] Exporting to {output_path}")
+            if not no_header:
+                print(f"[INFO] Exporting to {output_path}", file=sys.stderr)
         except IOError as e:
-            print(f"[ERROR] Could not open output file: {e}")
+            if not no_header:
+                print(f"[ERROR] Could not open output file: {e}")
             conn.close()
             sys.exit(1)
     else:
         output_file = sys.stdout
-        print("[INFO] Exporting to stdout")
-
-    print()
+        if not no_header:
+            print("[INFO] Exporting to stdout")
+            print()
 
     # Export records
     total_count = 0
@@ -295,12 +339,18 @@ def export_ledger(accepted_only: bool, output_path: Optional[str]):
     if output_path:
         output_file.close()
 
-    # Print summary
-    print()
-    print("=" * 60)
-    destination = output_path if output_path else "stdout"
-    print(f"[INFO] Exported {total_count} receipts ({accepted_count} accepted, {rejected_count} rejected) to {destination}")
-    print("=" * 60)
+    # Print summary (only if not suppressed)
+    if not no_header:
+        if output_path:
+            # When writing to file, print summary to stderr
+            destination = output_path
+            print(f"\n[INFO] Exported {total_count} receipts ({accepted_count} accepted, {rejected_count} rejected) to {destination}", file=sys.stderr)
+        else:
+            # When writing to stdout, print summary after JSON lines
+            print()
+            print("=" * 60)
+            print(f"[INFO] Exported {total_count} receipts ({accepted_count} accepted, {rejected_count} rejected) to stdout")
+            print("=" * 60)
 
     conn.close()
 
@@ -321,18 +371,25 @@ def main():
         default=None,
         help="Output file path (default: stdout)"
     )
+    parser.add_argument(
+        "--no-header",
+        action="store_true",
+        help="Suppress all human-readable output (pure JSONL)"
+    )
 
     args = parser.parse_args()
 
     try:
-        export_ledger(args.accepted_only, args.output)
+        export_ledger(args.accepted_only, args.output, args.no_header)
     except KeyboardInterrupt:
-        print("\n[INFO] Export interrupted by user")
+        if not args.no_header:
+            print("\n[INFO] Export interrupted by user")
         sys.exit(0)
     except Exception as e:
-        print(f"[ERROR] Unexpected error: {e}")
-        import traceback
-        traceback.print_exc()
+        if not args.no_header:
+            print(f"[ERROR] Unexpected error: {e}")
+            import traceback
+            traceback.print_exc()
         sys.exit(1)
 
 
