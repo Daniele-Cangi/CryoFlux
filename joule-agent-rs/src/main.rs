@@ -1,7 +1,7 @@
 use axum::{routing::{get, post}, Json, Router};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::{net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{fs, net::SocketAddr, path::Path, sync::Arc, time::{Duration, Instant}};
 use sysinfo::System;
 use chrono::Utc;
 
@@ -13,6 +13,44 @@ fn gpu_power_w(nvml: &Option<nvml_wrapper::Nvml>) -> f64 {
         }
     }
     0.0
+}
+
+#[derive(Clone, Deserialize)]
+struct JouleAgentConfig {
+    #[serde(default = "default_hz")]
+    hz: f64,
+    #[serde(default = "default_cpu_tdp_w")]
+    cpu_tdp_w: f64,
+    #[serde(default = "default_smoothing_alpha")]
+    smoothing_alpha: f64,
+    #[serde(default = "default_idle_learn_w")]
+    idle_learn_w: f64,
+    #[serde(default = "default_bind_addr")]
+    bind_addr: String,
+}
+
+#[derive(Deserialize)]
+struct RootConfig {
+    #[serde(default)]
+    joule_agent: JouleAgentConfig,
+}
+
+fn default_hz() -> f64 { 2.0 }
+fn default_cpu_tdp_w() -> f64 { 65.0 }
+fn default_smoothing_alpha() -> f64 { 0.2 }
+fn default_idle_learn_w() -> f64 { 5.0 }
+fn default_bind_addr() -> String { "127.0.0.1:8787".to_string() }
+
+impl Default for JouleAgentConfig {
+    fn default() -> Self {
+        Self {
+            hz: default_hz(),
+            cpu_tdp_w: default_cpu_tdp_w(),
+            smoothing_alpha: default_smoothing_alpha(),
+            idle_learn_w: default_idle_learn_w(),
+            bind_addr: default_bind_addr(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -42,14 +80,72 @@ struct State {
 #[derive(Deserialize)] struct TakeReq { joules: f64 }
 #[derive(Serialize)]   struct TakeResp { ok: bool, remaining_j: f64 }
 
+fn load_config() -> JouleAgentConfig {
+    // Try to load config.toml from repo root (parent directory)
+    let config_paths = vec![
+        Path::new("../config.toml"),
+        Path::new("config.toml"),
+        Path::new("../../config.toml"), // in case running from deep nested dir
+    ];
+
+    let mut base_config = JouleAgentConfig::default();
+
+    for path in config_paths {
+        if path.exists() {
+            if let Ok(contents) = fs::read_to_string(path) {
+                if let Ok(root) = toml::from_str::<RootConfig>(&contents) {
+                    base_config = root.joule_agent;
+                    println!("[JouleAgent] Loaded config from {}", path.display());
+                    break;
+                }
+            }
+        }
+    }
+
+    // Environment variables override config.toml
+    if let Ok(v) = std::env::var("JOULE_HZ") {
+        if let Ok(val) = v.parse::<f64>() {
+            base_config.hz = val;
+            println!("[JouleAgent] Override hz={} from JOULE_HZ env", val);
+        }
+    }
+    if let Ok(v) = std::env::var("JOULE_CPU_TDP_W") {
+        if let Ok(val) = v.parse::<f64>() {
+            base_config.cpu_tdp_w = val;
+            println!("[JouleAgent] Override cpu_tdp_w={} from JOULE_CPU_TDP_W env", val);
+        }
+    }
+    if let Ok(v) = std::env::var("JOULE_SMOOTHING") {
+        if let Ok(val) = v.parse::<f64>() {
+            base_config.smoothing_alpha = val;
+            println!("[JouleAgent] Override smoothing_alpha={} from JOULE_SMOOTHING env", val);
+        }
+    }
+    if let Ok(v) = std::env::var("JOULE_IDLE_LEARN_W") {
+        if let Ok(val) = v.parse::<f64>() {
+            base_config.idle_learn_w = val;
+            println!("[JouleAgent] Override idle_learn_w={} from JOULE_IDLE_LEARN_W env", val);
+        }
+    }
+    if let Ok(v) = std::env::var("JOULE_BIND_ADDR") {
+        base_config.bind_addr = v;
+        println!("[JouleAgent] Override bind_addr={} from JOULE_BIND_ADDR env", base_config.bind_addr);
+    }
+
+    base_config
+}
+
 #[tokio::main]
 async fn main() {
+    let agent_cfg = load_config();
+
     let cfg = Cfg {
-        cpu_tdp_w: env_f("JOULE_CPU_TDP_W", 65.0),
-        smoothing_alpha: env_f("JOULE_SMOOTHING", 0.2),
-        hz: env_f("JOULE_HZ", 1.0),
-        idle_learn_w: env_f("JOULE_IDLE_LEARN_W", 5.0),
+        cpu_tdp_w: agent_cfg.cpu_tdp_w,
+        smoothing_alpha: agent_cfg.smoothing_alpha,
+        hz: agent_cfg.hz,
+        idle_learn_w: agent_cfg.idle_learn_w,
     };
+
     let st = State {
         cfg: cfg.clone(),
         bucket_j: Arc::new(Mutex::new(0.0)),
@@ -139,16 +235,15 @@ async fn main() {
             }
         }));
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], 8787));
+    // Parse bind address from config
+    let addr: SocketAddr = agent_cfg.bind_addr.parse()
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], 8787)));
     println!("[JouleAgent] listening on http://{}", addr);
     // bind a TcpListener and serve via axum::serve for compatibility
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-fn env_f(key: &str, def: f64) -> f64 {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(def)
-}
 fn avg_cpu_usage(sys: &System) -> f32 {
     let cpus = sys.cpus(); if cpus.is_empty() { return 20.0; }
     let mut s = 0.0; for c in cpus { s += c.cpu_usage(); } s / (cpus.len() as f32)

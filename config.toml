@@ -1,0 +1,52 @@
+# JouleAgent config
+[joule_agent]
+hz = 2.0
+cpu_tdp_w = 65.0
+smoothing_alpha = 0.2
+idle_learn_w = 5.0
+bind_addr = "127.0.0.1:8787"
+
+# Orchestrator core
+[orchestrator]
+agent_url = "http://127.0.0.1:8787"
+receipts_db = "./state/receipts.db"
+seed = 42
+
+[orchestrator.model]
+encoder_model = "sentence-transformers/all-MiniLM-L6-v2"
+clf_base = "distilbert-base-uncased"
+lora_rank = 8
+
+[orchestrator.energy]
+min_joule_to_run = 1.0
+task_index_est_joules = 20.0
+task_lora_est_joules = 120.0
+
+[orchestrator.data]
+incoming_dir = "./data/incoming"
+holdout_csv = "./data/holdout.csv"
+embeddings_cache = "./state/embeddings"
+
+[orchestrator.storage]
+capsules_dir = "./state/capsules"
+base_dir = "./state/base_model"
+candidates_dir = "./state/candidates"
+
+[orchestrator.merge]
+lora_accept_min_delta = 0.003
+merge_every_n_capsules = 1
+
+# η-aware scheduler
+[orchestrator.scheduler]
+bandit_enabled = true
+ucb_c = 0.3
+warmup_runs = 0
+min_bucket_factor = 1.0
+epsilon = 0.1  # 10% epsilon-greedy exploration
+
+# Cost & Impact Model
+[cost_model]
+enabled = true
+kwh_price_eur = 0.30        # Electricity price (EUR per kWh)
+pue = 1.20                  # Power Usage Effectiveness (datacenter overhead)
+carbon_intensity_g_per_kwh = 300.0  # Carbon intensity (gCO2 per kWh)

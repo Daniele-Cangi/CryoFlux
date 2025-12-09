@@ -4,6 +4,7 @@ from __future__ import annotations
 import os, time, json, math, sqlite3, argparse, random, shutil, warnings
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, List, Tuple
+from pathlib import Path
 
 # Silenzia warning non critici
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -20,20 +21,22 @@ def b3(x: bytes) -> str: return blake3(x).hexdigest()
 # ---------------- Config ----------------
 @dataclass
 class EnergyConfig:
-    agent_url: str = os.environ.get("JOULE_AGENT_URL", "http://127.0.0.1:8787")
+    agent_url: str = "http://127.0.0.1:8787"
     min_joule_to_run: float = 1.0
+    task_index_est_joules: float = 20.0
+    task_lora_est_joules: float = 120.0
 
 @dataclass
 class MergeConfig:
-    lora_accept_min_delta: float = 0.003  # soglia morbida per sbloccare primi merge
+    lora_accept_min_delta: float = 0.003
     merge_every_n_capsules: int = 1
-    base_dir: str = "./state/base_model"   # dove persistere il tronco
-    candidates_dir: str = "./state/candidates"  # staging
+    base_dir: str = "./state/base_model"
+    candidates_dir: str = "./state/candidates"
 
 @dataclass
 class DataConfig:
     incoming_dir: str = "./data/incoming"
-    holdout_csv: str = "./data/holdout.csv"  # text,label
+    holdout_csv: str = "./data/holdout.csv"
     embeddings_cache: str = "./state/embeddings"
 
 @dataclass
@@ -44,8 +47,16 @@ class StoreConfig:
 @dataclass
 class ModelConfig:
     encoder_model: str = "sentence-transformers/all-MiniLM-L6-v2"
-    clf_base: str = "distilbert-base-uncased"  # base grezzo per permettere miglioramenti
+    clf_base: str = "distilbert-base-uncased"
     lora_rank: int = 8
+
+@dataclass
+class SchedulerConfig:
+    bandit_enabled: bool = True
+    ucb_c: float = 0.3
+    warmup_runs: int = 3
+    min_bucket_factor: float = 1.0
+    epsilon: float = 0.0  # Epsilon-greedy exploration probability
 
 @dataclass
 class Cfg:
@@ -54,7 +65,110 @@ class Cfg:
     data: DataConfig = field(default_factory=DataConfig)
     store: StoreConfig = field(default_factory=StoreConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    scheduler: SchedulerConfig = field(default_factory=SchedulerConfig)
     seed: int = 42
+
+def load_config() -> Cfg:
+    """Load configuration from config.toml if available, with env var overrides."""
+    cfg = Cfg()  # Start with defaults
+
+    # Try to find config.toml in repo root (parent of cryo-orchestrator)
+    config_paths = [
+        Path("../config.toml"),
+        Path("config.toml"),
+        Path("../../config.toml"),
+    ]
+
+    config_found = False
+    for path in config_paths:
+        if path.exists():
+            try:
+                import toml
+                data = toml.load(path)
+                print(f"[CryoFlux] Loaded config from {path}")
+
+                # Parse orchestrator section
+                if "orchestrator" in data:
+                    orch = data["orchestrator"]
+                    if "agent_url" in orch:
+                        cfg.energy.agent_url = orch["agent_url"]
+                    if "receipts_db" in orch:
+                        cfg.store.receipts_db = orch["receipts_db"]
+                    if "seed" in orch:
+                        cfg.seed = orch["seed"]
+
+                    # Parse nested sections
+                    if "model" in orch:
+                        m = orch["model"]
+                        if "encoder_model" in m:
+                            cfg.model.encoder_model = m["encoder_model"]
+                        if "clf_base" in m:
+                            cfg.model.clf_base = m["clf_base"]
+                        if "lora_rank" in m:
+                            cfg.model.lora_rank = m["lora_rank"]
+
+                    if "data" in orch:
+                        d = orch["data"]
+                        if "incoming_dir" in d:
+                            cfg.data.incoming_dir = d["incoming_dir"]
+                        if "holdout_csv" in d:
+                            cfg.data.holdout_csv = d["holdout_csv"]
+                        if "embeddings_cache" in d:
+                            cfg.data.embeddings_cache = d["embeddings_cache"]
+
+                    if "storage" in orch:
+                        s = orch["storage"]
+                        if "capsules_dir" in s:
+                            cfg.store.capsules_dir = s["capsules_dir"]
+                        if "base_dir" in s:
+                            cfg.merge.base_dir = s["base_dir"]
+                        if "candidates_dir" in s:
+                            cfg.merge.candidates_dir = s["candidates_dir"]
+
+                    if "energy" in orch:
+                        e = orch["energy"]
+                        if "min_joule_to_run" in e:
+                            cfg.energy.min_joule_to_run = e["min_joule_to_run"]
+                        if "task_index_est_joules" in e:
+                            cfg.energy.task_index_est_joules = e["task_index_est_joules"]
+                        if "task_lora_est_joules" in e:
+                            cfg.energy.task_lora_est_joules = e["task_lora_est_joules"]
+
+                    if "merge" in orch:
+                        mg = orch["merge"]
+                        if "lora_accept_min_delta" in mg:
+                            cfg.merge.lora_accept_min_delta = mg["lora_accept_min_delta"]
+                        if "merge_every_n_capsules" in mg:
+                            cfg.merge.merge_every_n_capsules = mg["merge_every_n_capsules"]
+
+                    if "scheduler" in orch:
+                        sched = orch["scheduler"]
+                        if "bandit_enabled" in sched:
+                            cfg.scheduler.bandit_enabled = sched["bandit_enabled"]
+                        if "ucb_c" in sched:
+                            cfg.scheduler.ucb_c = sched["ucb_c"]
+                        if "warmup_runs" in sched:
+                            cfg.scheduler.warmup_runs = sched["warmup_runs"]
+                        if "min_bucket_factor" in sched:
+                            cfg.scheduler.min_bucket_factor = sched["min_bucket_factor"]
+                        if "epsilon" in sched:
+                            cfg.scheduler.epsilon = sched["epsilon"]
+
+                config_found = True
+                break
+            except ImportError:
+                print("[CryoFlux] Warning: 'toml' package not found. Add 'toml' to requirements.txt")
+                break
+            except Exception as e:
+                print(f"[CryoFlux] Warning: Could not parse config.toml: {e}")
+                break
+
+    # Environment variable overrides
+    if "JOULE_AGENT_URL" in os.environ:
+        cfg.energy.agent_url = os.environ["JOULE_AGENT_URL"]
+        print(f"[CryoFlux] Override agent_url={cfg.energy.agent_url} from env")
+
+    return cfg
 
 # ---------------- Energy Client (Rust agent) ----------------
 class EnergyClient:
@@ -115,7 +229,7 @@ class Holdout:
 class TaskIndex:
     name = "index_refresh"
     def __init__(self, cfg: Cfg): self.cfg = cfg
-    def est_joule(self) -> float: return 20.0
+    def est_joule(self) -> float: return self.cfg.energy.task_index_est_joules
     def run(self) -> Dict[str, Any]:
         import zlib
         from sentence_transformers import SentenceTransformer
@@ -160,7 +274,7 @@ class TaskIndex:
 class TaskLoRA:
     name = "lora_delta"
     def __init__(self, cfg: Cfg): self.cfg = cfg
-    def est_joule(self) -> float: return 80.0
+    def est_joule(self) -> float: return self.cfg.energy.task_lora_est_joules
     def train_adapter(self) -> Tuple[str, Dict[str,Any]]:
         import warnings, logging
         warnings.filterwarnings("ignore")
@@ -335,21 +449,81 @@ class Orchestrator:
         self.energy = EnergyClient(cfg.energy.agent_url)
         self.receipts = Receipts(cfg.store.receipts_db)
         self.tasks = [TaskIndex(cfg), TaskLoRA(cfg)]
+
+        # Open DB connection for scheduler (with fallback logic)
+        self.scheduler_conn = None
+        if cfg.scheduler.bandit_enabled:
+            try:
+                # Resolve DB path with fallback
+                db_path = cfg.store.receipts_db
+                from pathlib import Path
+                path_obj = Path(db_path)
+                if not path_obj.exists():
+                    # Fallback to cryo-orchestrator/state/receipts.db
+                    fallback = Path("state/receipts.db")
+                    if fallback.exists():
+                        db_path = str(fallback)
+
+                self.scheduler_conn = sqlite3.connect(db_path)
+                print(f"[SCHEDULER] Connected to {db_path}")
+            except Exception as e:
+                print(f"[SCHEDULER][WARN] Could not open DB for scheduler: {e}")
+                print("[SCHEDULER] Will fall back to legacy choose(j)")
+
+        # Build task name -> task object mapping for scheduler
+        self.task_map = {task.name: task for task in self.tasks}
     def choose(self, j):
         # dynamic policy: choose task based on available Joule
-        if j >= 120.0:
+        lora_threshold = self.cfg.energy.task_lora_est_joules
+        index_threshold = self.cfg.energy.task_index_est_joules
+
+        if j >= lora_threshold:
             return self.tasks[1]  # LoRA
-        if j >= 20.0:
+        if j >= index_threshold:
             return self.tasks[0]  # Index
         return None
     def run(self):
         print(f"[CryoFlux] Orchestrator online — expecting JouleAgent at {self.cfg.energy.agent_url}")
+
+        # Import scheduler
+        try:
+            from scheduler import choose_task
+            scheduler_available = True
+        except ImportError:
+            print("[SCHEDULER][WARN] scheduler.py not found - using legacy choose(j)")
+            scheduler_available = False
+
         while True:
             try:
                 j = self.energy.bucket()
-                task = self.choose(j)
+
+                # Try scheduler first (if enabled and available)
+                task = None
+                if scheduler_available and self.scheduler_conn is not None:
+                    try:
+                        choice = choose_task(self.cfg, j, self.scheduler_conn)
+                        if choice is not None:
+                            # Map task name to task object
+                            task = self.task_map.get(choice.name)
+                            if task:
+                                reason = choice.reason
+                                score = choice.score
+                                score_str = f"score={score:.6f}" if score is not None else ""
+                                print(f"[SCHEDULER] using task={choice.name} reason={reason} {score_str}")
+                            else:
+                                print(f"[SCHEDULER][WARN] Unknown task selected: {choice.name}")
+                                task = None
+                    except Exception as e:
+                        print(f"[SCHEDULER][WARN] Scheduler error: {e}")
+                        task = None
+
+                # Fallback to legacy choose(j) if scheduler didn't select a task
+                if task is None:
+                    task = self.choose(j)
+
                 if task is None:
                     time.sleep(0.3); continue
+
                 need = task.est_joule()
                 if not self.energy.take(need):
                     time.sleep(0.2); continue
@@ -360,15 +534,21 @@ class Orchestrator:
                                   loss=res.get('loss',0.0), delta_hash=res.get('hash',''), meta=res.get('meta',{}))
                 print(f"[CryoFlux] {task.name} -> Δ={res.get('delta',0.0):.4f} | ok={res.get('ok')} | receipt={res.get('hash','')[:8]}…")
             except KeyboardInterrupt:
-                print("[CryoFlux] stopping"); break
+                print("[CryoFlux] stopping")
+                if self.scheduler_conn:
+                    self.scheduler_conn.close()
+                break
             except Exception as e:
                 print("[CryoFlux][ERR]", e); time.sleep(0.5)
 
 # ---------------- Boot ----------------
 if __name__ == "__main__":
+    # Load configuration
+    cfg = load_config()
+
     # ensure dirs
     for p in ["./data/incoming","./data","./state","./state/capsules","./state/base_model","./state/candidates","./state/embeddings"]:
         os.makedirs(p, exist_ok=True)
-    cfg = Cfg()
+
     random.seed(cfg.seed)
     Orchestrator(cfg).run()

@@ -39,7 +39,7 @@ state/
 cache/
 
 # Rust
-/target/
+target/
 Cargo.lock
 *.rlib
 

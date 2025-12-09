@@ -9,3 +9,4 @@ peft
 torch
 pyyaml
 requests
+toml
