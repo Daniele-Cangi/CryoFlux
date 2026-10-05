@@ -16,7 +16,11 @@ CANONICALIZATION = {"algorithm": "sorted-json", "version": "1"}
 
 def canonical_bytes(value: Any) -> bytes:
     """Return deterministic UTF-8 JSON bytes for receipt values."""
-    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON number: {value}")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -24,7 +28,11 @@ def sha256_bytes(value: bytes) -> str:
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
+
+
+def load_json_line(value: str) -> Any:
+    return json.loads(value, parse_constant=_reject_json_constant)
 
 
 def _result(status: str, errors: list[str], warnings: list[str], checked: list[str], receipt_hash: str | None) -> dict[str, Any]:
@@ -49,8 +57,10 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
 
     try:
         receipt = load_json(receipt_path)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         return _result("INVALID", [f"receipt parse error: {exc}"], [], [], None)
+    if not isinstance(receipt, dict):
+        return _result("INVALID", ["receipt must be a JSON object"], [], [], None)
     receipt_hash = sha256_bytes(canonical_bytes(receipt))
 
     if receipt.get("schema") != SCHEMA:
@@ -63,11 +73,17 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
         manifest = load_json(manifest_path)
     except FileNotFoundError:
         return _result("UNVERIFIABLE", errors + ["missing manifest.json"], warnings, checked, receipt_hash)
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError) as exc:
         return _result("INVALID", errors + [f"manifest parse error: {exc}"], warnings, checked, receipt_hash)
 
-    entries = {item.get("artifact_id"): item for item in manifest.get("artifacts", [])}
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+        return _result("INVALID", errors + ["manifest artifacts must be an array"], warnings, checked, receipt_hash)
+    if any(not isinstance(item, dict) for item in manifest["artifacts"]):
+        return _result("INVALID", errors + ["manifest entries must be objects"], warnings, checked, receipt_hash)
+    entries = {item.get("artifact_id"): item for item in manifest["artifacts"]}
     refs = receipt.get("artifacts", {})
+    if not isinstance(refs, dict):
+        return _result("INVALID", errors + ["receipt artifacts must be an object"], warnings, checked, receipt_hash)
     required_missing = False
     for name, artifact_id in refs.items():
         entry = entries.get(artifact_id)
@@ -97,7 +113,19 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
         if actual != entry.get("sha256") or actual != artifact_id:
             errors.append(f"hash mismatch: {name}")
 
-    if receipt.get("energy", {}).get("status") == "unavailable":
+    energy = receipt.get("energy", {})
+    if not isinstance(energy, dict):
+        errors.append("receipt energy must be an object")
+        energy = {}
+    parent = receipt.get("parent", {})
+    if not isinstance(parent, dict):
+        errors.append("receipt parent must be an object")
+    elif parent.get("receipt_hash") is not None:
+        parent_hash = parent["receipt_hash"]
+        if not isinstance(parent_hash, str) or not parent_hash.startswith("sha256:") or len(parent_hash) != 71 or any(c not in "0123456789abcdef" for c in parent_hash[7:]):
+            errors.append("parent receipt_hash must be a SHA-256 digest")
+
+    if energy.get("status") == "unavailable":
         warnings.append("energy evidence unavailable")
         required_missing = True
     else:
@@ -105,7 +133,7 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
         energy_entry = entries.get(energy_id)
         if energy_entry:
             try:
-                points = [json.loads(line) for line in (root / energy_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
+                points = [load_json_line(line) for line in (root / energy_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
                 joules = 0.0
                 for left, right in zip(points, points[1:]):
                     dt = (right["mono_ns"] - left["mono_ns"]) / 1_000_000_000
@@ -113,7 +141,7 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
                         errors.append("energy timestamps are not strictly increasing")
                         break
                     joules += ((left["watts"] + right["watts"]) / 2) * dt
-                declared = receipt["energy"].get("joules")
+                declared = energy.get("joules")
                 if declared is None or abs(joules - declared) > 1e-9:
                     errors.append("energy integration mismatch")
             except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
@@ -123,7 +151,7 @@ def verify_bundle(bundle: str | Path) -> dict[str, Any]:
     evaluation_entry = entries.get(evaluation_id)
     if evaluation_entry and evaluation_entry.get("availability") == "present":
         try:
-            rows = [json.loads(line) for line in (root / evaluation_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
+            rows = [load_json_line(line) for line in (root / evaluation_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
             if rows:
                 observed = rows[0]["candidate"] - rows[0]["baseline"]
                 declared = receipt["metrics"]["delta"]["value"]

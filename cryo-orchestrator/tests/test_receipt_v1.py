@@ -77,6 +77,42 @@ class ReceiptV1Tests(unittest.TestCase):
         result = verify_bundle(root)
         self.assertEqual(result["status"], "VALID", result)
 
+    def test_non_finite_numbers_are_rejected_by_canonicalizer(self):
+        with self.assertRaises(ValueError):
+            canonical_bytes({"delta": float("nan")})
+
+    def test_non_standard_json_number_is_invalid(self):
+        root = self.make_bundle()
+        (root / "receipt.json").write_text('{"schema":"cryoflux.receipt.v1","value":NaN}', encoding="utf-8")
+        result = verify_bundle(root)
+        self.assertEqual(result["status"], "INVALID", result)
+        self.assertIn("receipt parse error", result["errors"][0])
+
+    def test_non_standard_json_number_in_evidence_is_invalid(self):
+        root = self.make_bundle()
+        (root / "evidence" / "evaluation.jsonl").write_text(
+            '{"baseline":NaN,"candidate":0.15}\n', encoding="utf-8"
+        )
+        result = verify_bundle(root)
+        self.assertEqual(result["status"], "INVALID", result)
+        self.assertTrue(any("metric replay error" in error for error in result["errors"]))
+
+    def test_malformed_manifest_shape_is_invalid_without_crashing(self):
+        root = self.make_bundle()
+        (root / "manifest.json").write_bytes(canonical_bytes({"artifacts": {"unexpected": "shape"}}))
+        result = verify_bundle(root)
+        self.assertEqual(result["status"], "INVALID", result)
+        self.assertIn("manifest artifacts must be an array", result["errors"])
+
+    def test_invalid_parent_receipt_hash_is_rejected(self):
+        root = self.make_bundle()
+        receipt = json.loads((root / "receipt.json").read_text(encoding="utf-8"))
+        receipt["parent"]["receipt_hash"] = "sha256:" + "z" * 64
+        (root / "receipt.json").write_bytes(canonical_bytes(receipt))
+        result = verify_bundle(root)
+        self.assertEqual(result["status"], "INVALID", result)
+        self.assertIn("parent receipt_hash must be a SHA-256 digest", result["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()
