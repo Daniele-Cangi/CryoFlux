@@ -1,93 +1,177 @@
-"""Model-free verification for synthetic cryoflux.receipt.v1 bundles.
+"""Model-free verification for synthetic CryoFlux receipt.v1 bundles.
 
-This module authenticates bytes and relationships only.  It does not attest to
-honest hardware, honest execution, or scientific sufficiency of a claim.
+This module deliberately authenticates bytes and declared relationships only. It does
+not claim honest hardware, honest execution, or Proof-of-Learning.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
-VALID = "VALID"
-INVALID = "INVALID"
-UNVERIFIABLE = "UNVERIFIABLE"
+SCHEMA = "cryoflux.receipt.v1"
+CANONICALIZATION = {"algorithm": "sorted-json", "version": "1"}
 
 
-def canonical_json(value: Any) -> str:
-    """Return the deterministic JSON representation used by receipt v1."""
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, sort_keys=True, separators=(",", ":"))
+def canonical_bytes(value: Any) -> bytes:
+    """Return deterministic UTF-8 JSON bytes for receipt values."""
+    return (json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+
+
+def _reject_json_constant(value: str) -> Any:
+    raise ValueError(f"non-standard JSON number: {value}")
 
 
 def sha256_bytes(value: bytes) -> str:
-    return hashlib.sha256(value).hexdigest()
+    return "sha256:" + hashlib.sha256(value).hexdigest()
 
 
-def receipt_digest(receipt: dict[str, Any]) -> str:
-    """Hash a receipt without its self-referential canonical_hash field."""
-    unsigned = {k: v for k, v in receipt.items() if k != "canonical_hash"}
-    return sha256_bytes(canonical_json(unsigned).encode("utf-8"))
+def load_json(path: Path) -> Any:
+    return json.loads(path.read_text(encoding="utf-8"), parse_constant=_reject_json_constant)
 
 
-def verify_bundle(bundle: dict[str, Any]) -> dict[str, Any]:
-    """Verify a v1 bundle and return ``status`` plus explicit diagnostics.
+def load_json_line(value: str) -> Any:
+    return json.loads(value, parse_constant=_reject_json_constant)
 
-    ``bundle.artifacts`` maps manifest names to their byte content represented as
-    UTF-8 strings in this synthetic, dependency-free fixture format.  A missing
-    required artifact is UNVERIFIABLE; a present artifact with wrong bytes is
-    INVALID.  Claim sufficiency is intentionally reported separately.
-    """
+
+def _result(status: str, errors: list[str], warnings: list[str], checked: list[str], receipt_hash: str | None) -> dict[str, Any]:
+    return {
+        "status": status,
+        "errors": errors,
+        "warnings": warnings,
+        "checked_artifacts": checked,
+        "receipt_hash": receipt_hash,
+    }
+
+
+def verify_bundle(bundle: str | Path) -> dict[str, Any]:
+    """Verify one synthetic bundle and return the stable result contract."""
+    root = Path(bundle)
     errors: list[str] = []
     warnings: list[str] = []
-    receipt = bundle.get("receipt")
-    if not isinstance(receipt, dict) or receipt.get("schema") != "cryoflux.receipt.v1":
-        return {"status": INVALID, "errors": ["missing or unsupported receipt schema"], "warnings": []}
+    checked: list[str] = []
+    receipt_path = root / "receipt.json"
+    if not receipt_path.is_file():
+        return _result("UNVERIFIABLE", ["missing receipt.json"], [], [], None)
 
-    supplied = receipt.get("canonical_hash")
-    if not isinstance(supplied, str) or supplied != receipt_digest(receipt):
-        errors.append("canonical_hash does not match canonical receipt bytes")
+    try:
+        receipt = load_json(receipt_path)
+    except (OSError, ValueError) as exc:
+        return _result("INVALID", [f"receipt parse error: {exc}"], [], [], None)
+    if not isinstance(receipt, dict):
+        return _result("INVALID", ["receipt must be a JSON object"], [], [], None)
+    receipt_hash = sha256_bytes(canonical_bytes(receipt))
 
-    artifacts = bundle.get("artifacts", {})
-    if not isinstance(artifacts, dict):
-        errors.append("artifacts must be an object")
-        artifacts = {}
-    manifest = receipt.get("evidence", [])
-    if not isinstance(manifest, list):
-        errors.append("evidence manifest must be an array")
-        manifest = []
-    for entry in manifest:
-        name = entry.get("name") if isinstance(entry, dict) else None
-        if not name or not isinstance(entry, dict):
-            errors.append("evidence manifest contains malformed entry")
+    if receipt.get("schema") != SCHEMA:
+        errors.append("unsupported receipt schema")
+    if receipt.get("canonicalization") != CANONICALIZATION:
+        errors.append("unsupported canonicalization")
+
+    manifest_path = root / "manifest.json"
+    try:
+        manifest = load_json(manifest_path)
+    except FileNotFoundError:
+        return _result("UNVERIFIABLE", errors + ["missing manifest.json"], warnings, checked, receipt_hash)
+    except (OSError, ValueError) as exc:
+        return _result("INVALID", errors + [f"manifest parse error: {exc}"], warnings, checked, receipt_hash)
+
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("artifacts"), list):
+        return _result("INVALID", errors + ["manifest artifacts must be an array"], warnings, checked, receipt_hash)
+    if any(not isinstance(item, dict) for item in manifest["artifacts"]):
+        return _result("INVALID", errors + ["manifest entries must be objects"], warnings, checked, receipt_hash)
+    entries = {item.get("artifact_id"): item for item in manifest["artifacts"]}
+    refs = receipt.get("artifacts", {})
+    if not isinstance(refs, dict):
+        return _result("INVALID", errors + ["receipt artifacts must be an object"], warnings, checked, receipt_hash)
+    required_missing = False
+    for name, artifact_id in refs.items():
+        entry = entries.get(artifact_id)
+        if entry is None:
+            errors.append(f"manifest missing receipt artifact: {name}")
             continue
-        if name not in artifacts:
-            if entry.get("required", True):
-                warnings.append(f"required evidence missing: {name}")
+        availability = entry.get("availability", "present")
+        if availability != "present":
+            if availability == "unavailable":
+                required_missing = True
+            warnings.append(f"artifact unavailable: {name}")
             continue
-        raw = artifacts[name]
-        if not isinstance(raw, str):
-            errors.append(f"artifact is not UTF-8 fixture text: {name}")
+        rel = Path(entry.get("path", ""))
+        if rel.is_absolute() or ".." in rel.parts:
+            errors.append(f"unsafe artifact path: {name}")
             continue
-        data = raw.encode("utf-8")
-        if entry.get("size") != len(data) or entry.get("sha256") != sha256_bytes(data):
-            errors.append(f"artifact hash or size mismatch: {name}")
+        artifact_path = root / rel
+        if not artifact_path.is_file():
+            required_missing = True
+            warnings.append(f"artifact file missing: {name}")
+            continue
+        raw = artifact_path.read_bytes()
+        checked.append(artifact_id)
+        if len(raw) != entry.get("byte_length"):
+            errors.append(f"byte length mismatch: {name}")
+        actual = sha256_bytes(raw)
+        if actual != entry.get("sha256") or actual != artifact_id:
+            errors.append(f"hash mismatch: {name}")
 
-    previous = receipt.get("previous_receipt_hash")
-    if previous is not None and (not isinstance(previous, str) or len(previous) != 64):
-        errors.append("previous_receipt_hash is not a SHA-256 digest")
+    energy = receipt.get("energy", {})
+    if not isinstance(energy, dict):
+        errors.append("receipt energy must be an object")
+        energy = {}
+    parent = receipt.get("parent", {})
+    if not isinstance(parent, dict):
+        errors.append("receipt parent must be an object")
+    elif parent.get("receipt_hash") is not None:
+        parent_hash = parent["receipt_hash"]
+        if not isinstance(parent_hash, str) or not parent_hash.startswith("sha256:") or len(parent_hash) != 71 or any(c not in "0123456789abcdef" for c in parent_hash[7:]):
+            errors.append("parent receipt_hash must be a SHA-256 digest")
 
-    observation = receipt.get("observation", {})
-    if not isinstance(observation, dict):
-        errors.append("observation must be an object")
-    elif observation.get("energy_status") in {"unavailable", "not_yet_qualified"}:
-        warnings.append("energy evidence is unavailable; no energy claim is established")
-    elif "energy_joules" not in observation:
-        warnings.append("energy evidence is absent")
+    if energy.get("status") == "unavailable":
+        warnings.append("energy evidence unavailable")
+        required_missing = True
+    else:
+        energy_id = refs.get("energy_trace")
+        energy_entry = entries.get(energy_id)
+        if energy_entry:
+            try:
+                points = [load_json_line(line) for line in (root / energy_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
+                joules = 0.0
+                for left, right in zip(points, points[1:]):
+                    dt = (right["mono_ns"] - left["mono_ns"]) / 1_000_000_000
+                    if dt <= 0:
+                        errors.append("energy timestamps are not strictly increasing")
+                        break
+                    joules += ((left["watts"] + right["watts"]) / 2) * dt
+                declared = energy.get("joules")
+                if declared is None or abs(joules - declared) > 1e-9:
+                    errors.append("energy integration mismatch")
+            except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                errors.append(f"energy replay error: {exc}")
 
-    claim = receipt.get("claim", {})
-    claim_sufficient = bool(manifest) and not any("required evidence missing" in w for w in warnings)
-    if not claim_sufficient:
-        warnings.append("bundle integrity does not establish claim sufficiency")
+    evaluation_id = refs.get("evaluation_raw")
+    evaluation_entry = entries.get(evaluation_id)
+    if evaluation_entry and evaluation_entry.get("availability") == "present":
+        try:
+            rows = [load_json_line(line) for line in (root / evaluation_entry["path"]).read_text(encoding="utf-8").splitlines() if line]
+            if rows:
+                observed = rows[0]["candidate"] - rows[0]["baseline"]
+                declared = receipt["metrics"]["delta"]["value"]
+                if abs(observed - declared) > 1e-12:
+                    errors.append("metric mismatch")
+        except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"metric replay error: {exc}")
 
-    status = INVALID if errors else (UNVERIFIABLE if warnings else VALID)
-    return {"status": status, "errors": errors, "warnings": warnings, "claim_sufficient": claim_sufficient, "claim": claim}
+    if errors:
+        status = "INVALID"
+    elif required_missing:
+        status = "UNVERIFIABLE"
+    else:
+        status = "VALID"
+    return _result(status, errors, warnings, checked, receipt_hash)
+
+
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("bundle")
+    args = parser.parse_args()
+    print(json.dumps(verify_bundle(args.bundle), indent=2, sort_keys=True))
